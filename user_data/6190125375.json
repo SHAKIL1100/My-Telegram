@@ -1,0 +1,18 @@
+{
+    "accounts": {
+        "+972597518060": {
+            "is_frozen": false
+        },
+        "+972567930632": {
+            "is_frozen": false
+        },
+        "+972567935859": {
+            "is_frozen": false
+        }
+    },
+    "auto_2fa_enabled": false,
+    "auto_2fa_hint": null,
+    "auto_2fa_remaining_count": 0,
+    "auto_name": "\u2699\ufe0f Manage Accounts",
+    "user_name": "Shakil"
+}
