@@ -48,19 +48,20 @@ if not os.path.exists(SESSIONS_DIR):
 # Conversation states
 PHONE, CODE, PASSWORD = range(3)
 TFA_NEW_PASSWORD, TFA_HINT, TFA_DISABLE_PASSWORD = range(3, 6)
-# Removed EMAIL_PASSWORD, EMAIL_NEW, EMAIL_CODE as they are no longer used
-# EMAIL_PASSWORD, EMAIL_NEW, EMAIL_CODE = range(6, 9)
+AUTO_2FA_MENU, AUTO_2FA_SET_PASSWORD, AUTO_2FA_SET_HINT, AUTO_2FA_SET_COUNT = range(6, 10)
+AUTO_NAME_SET = 10
 
-# Updated Auto 2FA states (previous count logic kept)
-AUTO_2FA_MENU, AUTO_2FA_SET_PASSWORD, AUTO_2FA_SET_HINT, AUTO_2FA_SET_COUNT = range(9, 13)
+# New states for Folder Management
+FOLDER_MENU, CREATE_FOLDER_NAME = range(11, 13)
 
-# New state for Auto Name
-AUTO_NAME_SET = 13
+# New state for Add Session (simplified, no folder selection state needed here)
+ADD_SESSION_FILE = 13
+
 
 # --- Helper Functions ---
 
 # Phone number regex for validation
-PHONE_NUMBER_REGEX = r'^\+?\d{10,15}$' # Updated regex to ensure full match of 10-15 digits with optional '+'
+PHONE_NUMBER_REGEX = r'^\+?\d{10,15}$'
 
 def get_user_data_path(user_id: int) -> str:
     return os.path.join(USER_DATA_DIR, f"{user_id}.json")
@@ -68,22 +69,55 @@ def get_user_data_path(user_id: int) -> str:
 def read_user_data(user_id: int) -> dict:
     path = get_user_data_path(user_id)
     if not os.path.exists(path):
-        return {"accounts": {}, "auto_2fa_enabled": False, "auto_2fa_hint": None, "auto_2fa_remaining_count": 0, "auto_name": None}
+        # Initial structure with a 'Default' folder
+        return {
+            "folders": {
+                "Default": {"accounts": {}}
+            },
+            "current_folder": "Default",
+            "auto_2fa_enabled": False,
+            "auto_2fa_hint": None,
+            "auto_2fa_remaining_count": 0,
+            "auto_name": None
+        }
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             # Ensure all new keys are present even if file is old
+            data.setdefault("folders", {"Default": {"accounts": {}}})
+            data.setdefault("current_folder", "Default")
             data.setdefault("auto_2fa_enabled", False)
             data.setdefault("auto_2fa_hint", None)
             data.setdefault("auto_2fa_remaining_count", 0)
             data.setdefault("auto_name", None)
-            # Filter out invalid phone numbers from accounts on load
-            valid_accounts = {k: v for k, v in data.get("accounts", {}).items() if re.fullmatch(PHONE_NUMBER_REGEX, k)}
-            data["accounts"] = valid_accounts
+
+            # Migrate old 'accounts' structure to 'Default' folder if it exists
+            if "accounts" in data and not data["folders"].get("Default"):
+                data["folders"]["Default"] = {"accounts": data["accounts"]}
+                del data["accounts"]
+            elif "accounts" in data and data["folders"].get("Default"):
+                # Merge accounts from old structure into Default folder if both exist
+                data["folders"]["Default"]["accounts"].update(data["accounts"])
+                del data["accounts"]
+            
+            # Filter out invalid phone numbers from accounts in all folders on load
+            for folder_name, folder_data in data["folders"].items():
+                valid_accounts = {k: v for k, v in folder_data.get("accounts", {}).items() if re.fullmatch(PHONE_NUMBER_REGEX, k)}
+                folder_data["accounts"] = valid_accounts
+
             return data
     except (json.JSONDecodeError, IOError):
         logger.error(f"Error reading user data for {user_id}. Returning default structure.")
-        return {"accounts": {}, "auto_2fa_enabled": False, "auto_2fa_hint": None, "auto_2fa_remaining_count": 0, "auto_name": None}
+        return {
+            "folders": {
+                "Default": {"accounts": {}}
+            },
+            "current_folder": "Default",
+            "auto_2fa_enabled": False,
+            "auto_2fa_hint": None,
+            "auto_2fa_remaining_count": 0,
+            "auto_name": None
+        }
 
 def write_user_data(user_id: int, data: dict):
     path = get_user_data_path(user_id)
@@ -93,21 +127,26 @@ def write_user_data(user_id: int, data: dict):
     except IOError as e:
         logger.error(f"Failed to write user data for {user_id}: {e}")
 
-def save_account_info(user_id: int, user_name: str, phone_number: str, is_frozen: bool):
+def save_account_info(user_id: int, user_name: str, phone_number: str, is_frozen: bool, folder_name: str):
     data = read_user_data(user_id)
     data['user_name'] = user_name
-    if 'accounts' not in data:
-        data['accounts'] = {}
-    data['accounts'][phone_number] = {"is_frozen": is_frozen}
+    if folder_name not in data['folders']:
+        data['folders'][folder_name] = {"accounts": {}}
+    data['folders'][folder_name]['accounts'][phone_number] = {"is_frozen": is_frozen}
     write_user_data(user_id, data)
-    logger.info(f"Saved info for account {phone_number} for user {user_id}")
+    logger.info(f"Saved info for account {phone_number} in folder '{folder_name}' for user {user_id}")
 
-def remove_account_info(user_id: int, phone_number: str):
+def remove_account_info(user_id: int, phone_number: str, folder_name: str):
     data = read_user_data(user_id)
-    if 'accounts' in data and phone_number in data['accounts']:
-        del data['accounts'][phone_number]
+    if folder_name in data['folders'] and phone_number in data['folders'][folder_name]['accounts']:
+        del data['folders'][folder_name]['accounts'][phone_number]
+        # If folder becomes empty, optionally remove it (except Default)
+        if not data['folders'][folder_name]['accounts'] and folder_name != "Default":
+            del data['folders'][folder_name]
+            if data['current_folder'] == folder_name: # If current folder was deleted, switch to Default
+                data['current_folder'] = "Default"
     write_user_data(user_id, data)
-    logger.info(f"Removed account {phone_number} for user {user_id}")
+    logger.info(f"Removed account {phone_number} from folder '{folder_name}' for user {user_id}")
 
 def get_session_path(user_id: int, phone_number: str) -> str:
     user_session_dir = os.path.join(SESSIONS_DIR, str(user_id))
@@ -132,8 +171,8 @@ async def check_spam_status(client: TelegramClient) -> bool:
         logger.error(f"An error occurred while checking @SpamBot: {e}")
         return False
         
-async def perform_logout(user_id: int, phone_number: str):
-    remove_account_info(user_id, phone_number)
+async def perform_logout(user_id: int, phone_number: str, folder_name: str):
+    remove_account_info(user_id, phone_number, folder_name)
     session_path = get_session_path(user_id, phone_number)
     
     # Check if the session file exists before attempting to connect or remove it
@@ -196,15 +235,25 @@ async def safe_edit_or_reply(update: Update, context: ContextTypes.DEFAULT_TYPE,
             except Exception as e:
                 logger.warning(f"Could not answer callback query: {e}")
 
+# New helper function to handle transitions from conversation states to main menu options
+async def go_to_main_menu_option(update: Update, context: ContextTypes.DEFAULT_TYPE, target_function) -> int:
+    """Helper to go to a main menu option and end the current conversation."""
+    await target_function(update, context)
+    return ConversationHandler.END
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Start command or 'Back to Main Menu' callback received.")
     reply_keyboard = [
         ["➕ Add New Account", "⚙️ Manage Accounts"],
-        ["⚙️ Auto 2FA Settings", "📝 Auto Name Settings"]
+        ["⚙️ Auto 2FA Settings", "📝 Auto Name Settings"],
+        ["📊 My Accounts", "🗂️ Your Folders"], # Added new buttons
+        ["➕ Add Session"] # New button for adding session
     ]
     markup = ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
-    await safe_edit_or_reply(update, context, "Welcome! Please choose an option or send /help for more info.", reply_markup=markup)
+    user_data = read_user_data(update.effective_user.id)
+    current_folder = user_data.get('current_folder', 'Default')
+    await safe_edit_or_reply(update, context, f"Welcome! Current folder: **{current_folder}**. Please choose an option or send /help for more info.", reply_markup=markup, parse_mode='Markdown')
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -218,16 +267,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /help - Shows this help message.\n\n"
         "<b><u>Main Menu Buttons:</u></b>\n"
         "▪️ <b>➕ Add New Account</b>: Start the process to log in with a new Telegram account.\n"
-        "▪️ <b>⚙️ Manage Accounts</b>: View, manage, and get stats for your added accounts.\n"
+        "▪️ <b>⚙️ Manage Accounts</b>: View, manage, and get stats for your added accounts in the current folder.\n"
         "▪️ <b>⚙️ Auto 2FA Settings</b>: Set password and hint for automatic 2FA setup.\n"
-        "▪️ <b>📝 Auto Name Settings</b>: Set a default name to automatically apply to new accounts upon login."
+        "▪️ <b>📝 Auto Name Settings</b>: Set a default name to automatically apply to new accounts upon login.\n"
+        "▪️ <b>📊 My Accounts</b>: View a summary of all your accounts across all folders.\n"
+        "▪️ <b>🗂️ Your Folders</b>: Manage your account folders and switch between them.\n"
+        "▪️ <b>➕ Add Session</b>: Upload a .session file to add an account."
     )
     await update.message.reply_text(help_text, parse_mode='HTML')
 
 async def add_account_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_data = read_user_data(update.effective_user.id)
+    current_folder = user_data.get('current_folder', 'Default')
     await update.message.reply_text(
-        "Send the phone number in international format (e.g., 88017... or +88017...). \n\nSend /cancel to abort.",
-        reply_markup=ReplyKeyboardRemove()
+        f"Send the phone number in international format (e.g., 88017... or +88017...). \n\nNew account will be saved to folder: **{current_folder}**.\n\nSend /cancel to abort.",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode='Markdown'
     )
     return PHONE
 
@@ -279,6 +334,8 @@ async def code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     client: TelegramClient = context.user_data['client']
     phone = context.user_data['phone']
     user_id = update.message.from_user.id
+    user_data = read_user_data(user_id)
+    current_folder = user_data.get('current_folder', 'Default')
 
     try:
         await client.sign_in(phone, update.message.text, phone_code_hash=context.user_data['phone_code_hash'])
@@ -288,17 +345,12 @@ async def code_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         status_message = "⚠️ Account Status: This account is LIMITED or BLOCKED!" if is_restricted else "✅ Account Status: No restrictions found."
         
         user = update.message.from_user
-        save_account_info(user.id, user.first_name, phone, is_frozen=is_restricted)
+        save_account_info(user.id, user.first_name, phone, is_frozen=is_restricted, folder_name=current_folder)
 
-        # Check for auto 2FA setting
-        user_data = read_user_data(user_id)
-        
         # --- Apply Auto Name if set ---
         auto_name = user_data.get('auto_name')
         if auto_name:
             try:
-                # Removed the condition that checks if the name is not set or is phone number.
-                # Now it will always try to update the name if auto_name is set.
                 await client(UpdateProfileRequest(first_name=auto_name, last_name='')) # Set last_name to empty string
                 await update.message.reply_text(f"✅ Auto Name '{auto_name}' applied to this account (existing name cleared).")
             except Exception as e:
@@ -392,6 +444,8 @@ async def password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     client: TelegramClient = context.user_data['client']
     phone = context.user_data['phone']
     user_id = update.message.from_user.id
+    user_data = read_user_data(user_id)
+    current_folder = user_data.get('current_folder', 'Default')
 
     try:
         await client.sign_in(password=update.message.text)
@@ -401,15 +455,12 @@ async def password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         status_message = "⚠️ Account Status: This account is LIMITED or BLOCKED!" if is_restricted else "✅ Account Status: No restrictions found."
         
         user = update.message.from_user
-        save_account_info(user.id, user.first_name, phone, is_frozen=is_restricted)
+        save_account_info(user.id, user.first_name, phone, is_frozen=is_restricted, folder_name=current_folder)
 
         # --- Apply Auto Name if set ---
-        user_data = read_user_data(user_id)
         auto_name = user_data.get('auto_name')
         if auto_name:
             try:
-                # Removed the condition that checks if the name is not set or is phone number.
-                # Now it will always try to update the name if auto_name is set.
                 await client(UpdateProfileRequest(first_name=auto_name, last_name='')) # Set last_name to empty string
                 await update.message.reply_text(f"✅ Auto Name '{auto_name}' applied to this account (existing name cleared).")
             except Exception as e:
@@ -491,6 +542,17 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     if 'temp_auto_2fa_password' in context.user_data:
         del context.user_data['temp_auto_2fa_password']
+    
+    # Clean up temporary session file if it exists
+    if 'temp_session_file_path' in context.user_data and os.path.exists(context.user_data['temp_session_file_path']):
+        try:
+            os.remove(context.user_data['temp_session_file_path'])
+            logger.info(f"Removed temporary session file: {context.user_data['temp_session_file_path']}")
+        except OSError as e:
+            logger.error(f"Error removing temporary session file during cancel: {e}")
+    if 'temp_session_phone_number' in context.user_data:
+        del context.user_data['temp_session_phone_number']
+
 
     # Clear all temporary data from user_data when conversation ends
     context.user_data.clear()    
@@ -536,15 +598,14 @@ async def validate_account(user_id: int, phone_num: str) -> dict:
 
 async def manage_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    
-    # Initial "Checking..." message
-    await safe_edit_or_reply(update, context, "Checking your accounts, please wait...")
-
     user_data = read_user_data(user_id)
-    account_info_stored = user_data.get("accounts", {})
+    current_folder = user_data.get('current_folder', 'Default')
+    account_info_stored = user_data.get("folders", {}).get(current_folder, {}).get("accounts", {})
     
+    await safe_edit_or_reply(update, context, f"Checking accounts in folder **{current_folder}**, please wait...", parse_mode='Markdown')
+
     if not account_info_stored:
-        await safe_edit_or_reply(update, context, "No accounts added yet.")
+        await safe_edit_or_reply(update, context, f"No accounts added to folder **{current_folder}** yet.", parse_mode='Markdown')
         return
 
     tasks = []
@@ -575,10 +636,10 @@ async def manage_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if accounts_to_remove:
         for phone_num in accounts_to_remove:
-            remove_account_info(user_id, phone_num)
+            remove_account_info(user_id, phone_num, current_folder) # Pass current_folder here
 
     if not valid_accounts_list:
-        await safe_edit_or_reply(update, context, "No successfully logged-in accounts found.")
+        await safe_edit_or_reply(update, context, f"No successfully logged-in accounts found in folder **{current_folder}**.", parse_mode='Markdown')
         return
 
     # Sort accounts for consistent display and navigation
@@ -592,7 +653,7 @@ async def manage_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Get data from cached_live_statuses for display
         tfa_on = live_statuses.get(phone_num, {}).get("tfa_on", False)
         active_sessions_count = live_statuses.get(phone_num, {}).get("active_sessions_count", 0)
-        is_frozen = user_data.get("accounts", {}).get(phone_num, {}).get("is_frozen", False) # Still get frozen status from stored data
+        is_frozen = user_data.get("folders", {}).get(current_folder, {}).get("accounts", {}).get(phone_num, {}).get("is_frozen", False) # Get frozen status from stored data
 
         tfa_icon = " 🔒" if tfa_on else ""
         frozen_icon = " ❄️" if is_frozen else ""
@@ -602,7 +663,7 @@ async def manage_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         main_button = InlineKeyboardButton(display_text, callback_data=f"manage_{phone_num}")
         keyboard.append([main_button])
 
-    await safe_edit_or_reply(update, context, "Select an account to manage:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit_or_reply(update, context, f"Select an account to manage in folder **{current_folder}**:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 
 # New callback handlers for "Previous" and "Next" account navigation
@@ -626,6 +687,8 @@ async def next_account_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     user_id = query.from_user.id
+    user_data = read_user_data(user_id)
+    current_folder = user_data.get('current_folder', 'Default')
     callback_data_parts = query.data.split("_")
     if len(callback_data_parts) == 2 and re.fullmatch(PHONE_NUMBER_REGEX, callback_data_parts[1]):
         phone_number = callback_data_parts[1]
@@ -634,7 +697,7 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await safe_edit_or_reply(update, context, "An internal error occurred: Invalid data for logout.")
         return
 
-    await perform_logout(user_id, phone_number)
+    await perform_logout(user_id, phone_number, current_folder) # Pass current_folder here
     
     # After deletion, refresh the manage accounts list
     await manage_accounts(update, context)
@@ -723,7 +786,7 @@ async def manage_account_callback(update: Update, context: ContextTypes.DEFAULT_
 
     keyboard.append([InlineKeyboardButton("« Back to List", callback_data="back_to_manage_list")])
 
-    await safe_edit_or_reply(update, context, text=f"Managing account: {phone_number}", reply_markup=InlineKeyboardMarkup(keyboard))
+    await safe_edit_or_reply(update, context, text=f"Managing account: {phone_number}", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
 async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -774,17 +837,17 @@ async def confirm_delete_all_chats_callback(update: Update, context: ContextType
 async def delete_all_chat_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    callback_data_parts = query.data.split("_")
-    # Adjusted index for phone_number based on new callback_data format
-    if len(callback_data_parts) == 5 and re.fullmatch(PHONE_NUMBER_REGEX, callback_data_parts[4]):
-        phone_number = callback_data_parts[4]    
-    else:
-        logger.error(f"Invalid callback_data format for delete_all_chat_history_callback: {query.data}")
-        await safe_edit_or_reply(update, context, "An internal error occurred: Invalid data for chat deletion.")
+    user_id = query.from_user.id
+    user_data = read_user_data(user_id)
+    current_folder = user_data.get('current_folder', 'Default')
+    phone_number = context.user_data.get('phone_to_clear_history') # Retrieve from context
+
+    if not phone_number:
+        logger.error("Phone number not found in context for delete_all_chat_history_callback.")
+        await safe_edit_or_reply(update, context, "An internal error occurred: Could not determine account for chat deletion.")
         await manage_accounts(update, context)
         return
 
-    user_id = query.from_user.id
     session_path = get_session_path(user_id, phone_number)
 
     await safe_edit_or_reply(update, context, f"Starting to delete all chat history and leave groups for _{phone_number}_. This may take some time...", parse_mode='Markdown')
@@ -796,7 +859,7 @@ async def delete_all_chat_history_callback(update: Update, context: ContextTypes
         if not await client.is_user_authorized():
             await safe_edit_or_reply(update, context, "Session is invalid. Cannot delete chats.")
             if os.path.exists(session_path): os.remove(session_path)
-            remove_account_info(user_id, phone_number)
+            remove_account_info(user_id, phone_number, current_folder) # Pass current_folder
             return
 
         async for dialog in client.iter_dialogs():
@@ -851,7 +914,9 @@ async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not await client.is_user_authorized():
             await safe_edit_or_reply(update, context, "Session is invalid. Removing this invalid session from your list.")
             if os.path.exists(session_path): os.remove(session_path)
-            remove_account_info(user_id, phone_number)
+            user_data = read_user_data(user_id)
+            current_folder = user_data.get('current_folder', 'Default')
+            remove_account_info(user_id, phone_number, current_folder) # Pass current_folder
             return
 
         async for message in client.iter_messages(777000, limit=100):
@@ -886,7 +951,9 @@ async def _fetch_and_display_sessions_task(update: Update, context: ContextTypes
                 text="Session is invalid. Removing it."
             )
             if os.path.exists(session_path): os.remove(session_path)
-            remove_account_info(user_id, phone_number)
+            user_data = read_user_data(user_id)
+            current_folder = user_data.get('current_folder', 'Default')
+            remove_account_info(user_id, phone_number, current_folder) # Pass current_folder
             return
         
         authorizations_response = await client(GetAuthorizationsRequest())
@@ -940,7 +1007,6 @@ async def active_sessions_callback(update: Update, context: ContextTypes.DEFAULT
     # Send initial "Fetching..." message
     initial_message = await safe_edit_or_reply(update, context, f"Fetching active sessions for {phone_number}...")
     
-    # Ensure initial_message is not None before proceeding
     if not initial_message:
         logger.error("Failed to send initial message for active sessions.")
         return
@@ -984,8 +1050,9 @@ async def terminate_session_callback(update: Update, context: ContextTypes.DEFAU
         if "AUTH_UNREGISTERED" in str(e):
             logger.error(f"AuthKeyUnregisteredError during session termination for {phone_number}: {e}")
             await safe_edit_or_reply(update, context, "Session is unregistered/invalid. Please re-add the account.", parse_mode='Markdown')
-            remove_account_info(user_id, phone_number)
-            if os.path.exists(get_session_path(user_id, phone_number)): os.remove(get_session_path(user_id, phone_number))
+            user_data = read_user_data(user_id)
+            current_folder = user_data.get('current_folder', 'Default')
+            remove_account_info(user_id, phone_number, current_folder) # Pass current_folder
         elif "FROZEN_METHOD_INVALID" in str(e):
             logger.warning(f"FROZEN_METHOD_INVALID for {phone_number} during session termination: {e}")
             await safe_edit_or_reply(update, context, f"❌ Account `{phone_number}` is restricted by Telegram. Cannot terminate sessions. Please check the account manually in the official app.", parse_mode='Markdown')
@@ -1031,9 +1098,9 @@ async def logout_all_others_callback(update: Update, context: ContextTypes.DEFAU
                 await query.message.reply_text(f"No other active sessions found to terminate for {phone_number}.")
         else:
             await safe_edit_or_reply(update, context, "Session is invalid or already logged out. Please re-add the account.")
-            remove_account_info(user_id, phone_number)
-            if os.path.exists(get_session_path(user_id, phone_number)):
-                os.remove(get_session_path(user_id, phone_number))
+            user_data = read_user_data(user_id)
+            current_folder = user_data.get('current_folder', 'Default')
+            remove_account_info(user_id, phone_number, current_folder) # Pass current_folder
             
         # Re-fetch and display sessions after termination
         await active_sessions_callback(update, context) # Changed to call active_sessions_callback directly
@@ -1043,8 +1110,9 @@ async def logout_all_others_callback(update: Update, context: ContextTypes.DEFAU
         if "AUTH_UNREGISTERED" in str(e):
             logger.error(f"AuthKeyUnregisteredError during session termination for {phone_number}: {e}")
             await safe_edit_or_reply(update, context, "Session is unregistered/invalid. Please re-add the account.", parse_mode='Markdown')
-            remove_account_info(user_id, phone_number)
-            if os.path.exists(get_session_path(user_id, phone_number)): os.remove(get_session_path(user_id, phone_number))
+            user_data = read_user_data(user_id)
+            current_folder = user_data.get('current_folder', 'Default')
+            remove_account_info(user_id, phone_number, current_folder) # Pass current_folder
         elif "FROZEN_METHOD_INVALID" in str(e):
             logger.warning(f"FROZEN_METHOD_INVALID for {phone_number} during session termination: {e}")
             await safe_edit_or_reply(update, context, f"❌ Account `{phone_number}` is restricted by Telegram. Cannot terminate sessions. Please check the account manually in the official app.", parse_mode='Markdown')
@@ -1365,10 +1433,234 @@ async def auto_name_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await auto_name_settings_menu(update, context)
     return ConversationHandler.END
 
+# --- New Folder Management Functions ---
+async def my_folders_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    user_data = read_user_data(user_id)
+    folders = user_data.get('folders', {})
+    current_folder = user_data.get('current_folder', 'Default')
+
+    keyboard = []
+    total_accounts_in_all_folders = 0
+
+    # Sort folders alphabetically, with 'Default' always first
+    sorted_folder_names = sorted(folders.keys())
+    if "Default" in sorted_folder_names:
+        sorted_folder_names.remove("Default")
+        sorted_folder_names.insert(0, "Default")
+
+    for folder_name in sorted_folder_names:
+        accounts_in_folder = folders[folder_name].get('accounts', {})
+        num_accounts = len(accounts_in_folder)
+        total_accounts_in_all_folders += num_accounts
+        
+        selected_indicator = "(Selected)" if folder_name == current_folder else ""
+        button_text = f"🗂️ {folder_name} {selected_indicator} ({num_accounts} accounts)"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_folder_{folder_name}")])
+    
+    keyboard.append([InlineKeyboardButton("➕ Create New Folder", callback_data="create_new_folder")])
+    keyboard.append([InlineKeyboardButton("« Back to Main Menu", callback_data="back_to_start")])
+
+    text = f"<b>Your Account Folders:</b>\n\nSelect a folder to view its accounts, or create a new one.\n\nTotal Accounts Across All Folders: {total_accounts_in_all_folders}"
+    await safe_edit_or_reply(update, context, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    return FOLDER_MENU
+
+async def create_new_folder_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await safe_edit_or_reply(update, context, "Please send the name for the new folder. Send /cancel to abort.")
+    return CREATE_FOLDER_NAME
+
+async def create_folder_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    new_folder_name = update.message.text.strip()
+
+    if not new_folder_name:
+        await update.message.reply_text("Folder name cannot be empty. Please send a valid name or /cancel.")
+        return CREATE_FOLDER_NAME
+
+    user_data = read_user_data(user_id)
+    if new_folder_name in user_data['folders']:
+        await update.message.reply_text(f"Folder '{new_folder_name}' already exists. Please choose a different name or /cancel.")
+        return CREATE_FOLDER_NAME
+    
+    user_data['folders'][new_folder_name] = {"accounts": {}}
+    user_data['current_folder'] = new_folder_name # Automatically select the new folder
+    write_user_data(user_id, user_data)
+
+    await update.message.reply_text(f"Folder '{new_folder_name}' created and selected as current folder.")
+    await my_folders_menu(update, context) # Go back to folder menu
+    return ConversationHandler.END
+
+async def select_folder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    selected_folder_name = query.data.split("_")[2] # e.g., "select_folder_MyFolder"
+
+    user_data = read_user_data(user_id)
+    if selected_folder_name in user_data['folders']:
+        user_data['current_folder'] = selected_folder_name
+        write_user_data(user_id, user_data)
+        await safe_edit_or_reply(update, context, f"Folder **{selected_folder_name}** selected as current. All new accounts will be saved here.", parse_mode='Markdown')
+        await start(update, context) # Go back to main menu
+    else:
+        await safe_edit_or_reply(update, context, "Selected folder not found. Please try again.")
+    return ConversationHandler.END
+
+async def my_accounts_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    user_data = read_user_data(user_id)
+    folders = user_data.get('folders', {})
+    total_accounts = 0
+    accounts_per_folder_summary = []
+
+    # Sort folders alphabetically, with 'Default' always first
+    sorted_folder_names = sorted(folders.keys())
+    if "Default" in sorted_folder_names:
+        sorted_folder_names.remove("Default")
+        sorted_folder_names.insert(0, "Default")
+
+    for folder_name in sorted_folder_names:
+        accounts_in_folder = folders[folder_name].get('accounts', {})
+        num_accounts = len(accounts_in_folder)
+        total_accounts += num_accounts
+        accounts_per_folder_summary.append(f"▪️ <b>{folder_name}</b>: {num_accounts} accounts")
+
+    summary_text = f"<b>Your Account Summary:</b>\n\nTotal Accounts: <b>{total_accounts}</b>\n\n"
+    if accounts_per_folder_summary:
+        summary_text += "<b>Accounts per Folder:</b>\n" + "\n".join(accounts_per_folder_summary)
+    else:
+        summary_text += "No accounts added yet."
+
+    keyboard = [[InlineKeyboardButton("« Back to Main Menu", callback_data="back_to_start")]]
+    await safe_edit_or_reply(update, context, summary_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
 
 # --- New Function: To handle direct phone number input as a conversation entry ---
 async def direct_phone_number_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await phone_number_handler(update, context)
+
+# --- New Add Session Functions ---
+async def add_session_file_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await safe_edit_or_reply(update, context, "Please send the `.session` file you want to add. Make sure it's a valid Telethon session file. Send /cancel to abort.", reply_markup=ReplyKeyboardRemove())
+    return ADD_SESSION_FILE
+
+async def _process_session_file_task(update: Update, context: ContextTypes.DEFAULT_TYPE, session_file_path_temp: str, chat_id: int, message_id: int | None) -> None:
+    """
+    Background task to process the uploaded session file and add the account.
+    """
+    user_id = update.effective_user.id
+    client = None
+    phone_number = None
+    user_name = update.effective_user.first_name # Use bot user's name for now
+    user_data = read_user_data(user_id)
+    current_folder = user_data.get('current_folder', 'Default')
+
+    try:
+        client = TelegramClient(session_file_path_temp, API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            final_text = "The provided session file is invalid or expired. Please try again with a valid session file."
+            return
+        
+        me = await client.get_me()
+        phone_number = me.phone
+        if not phone_number:
+            final_text = "Could not retrieve phone number from the session file. Please ensure it's a valid user session."
+            return
+
+        await client.disconnect()
+
+        # Move the session file to its final destination
+        final_session_path = get_session_path(user_id, "+" + phone_number) # Ensure phone number is always with '+'
+        try:
+            if os.path.exists(final_session_path):
+                os.remove(final_session_path) # Remove old session file if exists
+            os.rename(session_file_path_temp, final_session_path)
+            logger.info(f"Moved session file from {session_file_path_temp} to {final_session_path}")
+        except Exception as e:
+            logger.error(f"Error moving session file: {e}")
+            final_text = f"Failed to save session file: {e}. Please try again."
+            return
+
+        # Save account info to user data in the current folder
+        save_account_info(user_id, user_name, "+" + phone_number, is_frozen=False, folder_name=current_folder)
+
+        final_text = f"Account **+{phone_number}** successfully added to folder **{current_folder}**!"
+    except Exception as e:
+        logger.error(f"Error processing session file in background task: {e}")
+        final_text = f"An error occurred while processing the session file: {e}. Please try again."
+    finally:
+        if client and client.is_connected():
+            await client.disconnect()
+        if os.path.exists(session_file_path_temp):
+            try:
+                os.remove(session_file_path_temp)
+            except OSError as e:
+                logger.error(f"Error cleaning up temporary session file {session_file_path_temp}: {e}")
+        
+        # Send or edit the final message
+        if message_id:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text=final_text, parse_mode='Markdown' # Ensure markdown is parsed
+            )
+        else: # If no message_id, send a new message
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=final_text, parse_mode='Markdown'
+            )
+
+
+async def receive_session_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    
+    if not update.message.document:
+        await update.message.reply_text("That doesn't look like a file. Please send a `.session` file or /cancel.")
+        return ADD_SESSION_FILE
+
+    file_id = update.message.document.file_id
+    file_name = update.message.document.file_name
+
+    if not file_name.endswith('.session'):
+        await update.message.reply_text("Invalid file type. Please send a `.session` file or /cancel.")
+        return ADD_SESSION_FILE
+
+    # Send initial "Processing your session file..." message
+    initial_message = await safe_edit_or_reply(update, context, "Processing your session file, please wait...")
+    
+    if not initial_message:
+        logger.error("Failed to send initial message for session file processing.")
+        # If initial message fails, we should still try to process the file or inform the user
+        await update.message.reply_text("Failed to send processing message, but I'll try to process your file. Please wait for a new message with the result.")
+        chat_id = update.effective_chat.id
+        message_id = None # No message_id to update, task will send a new one
+    else:
+        chat_id = initial_message.chat_id
+        message_id = initial_message.message_id
+
+    # Generate a unique temporary file name to avoid conflicts if multiple files are sent quickly
+    session_file_path_temp = os.path.join(SESSIONS_DIR, f"{user_id}_temp_{os.urandom(4).hex()}_{file_name}")
+    try:
+        new_file = await context.bot.get_file(file_id)
+        await new_file.download_to_drive(session_file_path_temp)
+        logger.info(f"Downloaded session file to: {session_file_path_temp}")
+
+        # Spawn a new task to process the session file in the background
+        asyncio.create_task(
+            _process_session_file_task(update, context, session_file_path_temp, chat_id, message_id)
+        )
+
+        return ADD_SESSION_FILE # Stay in ADD_SESSION_FILE state to allow more files
+    except Exception as e:
+        logger.error(f"Error downloading session file: {e}")
+        await safe_edit_or_reply(update, context, f"An error occurred during file download: {e}. Please try again or /cancel.")
+        if os.path.exists(session_file_path_temp):
+            try:
+                os.remove(session_file_path_temp)
+            except OSError as e:
+                logger.error(f"Error cleaning up temporary session file {session_file_path_temp}: {e}")
+        return ADD_SESSION_FILE
 
 
 # --- Main Application Setup ---
@@ -1384,21 +1676,30 @@ def main() -> None:
         ],
         states={
             PHONE: [
-                MessageHandler(filters.Regex('^⚙️ Manage Accounts$'), manage_accounts),    
-                MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), auto_2fa_settings_menu),
-                MessageHandler(filters.Regex('^📝 Auto Name Settings$'), auto_name_settings_menu),
+                MessageHandler(filters.Regex('^⚙️ Manage Accounts$'), lambda update, context: go_to_main_menu_option(update, context, manage_accounts)),
+                MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_2fa_settings_menu)),
+                MessageHandler(filters.Regex('^📝 Auto Name Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_name_settings_menu)),
+                MessageHandler(filters.Regex('^📊 My Accounts$'), lambda update, context: go_to_main_menu_option(update, context, my_accounts_summary)),
+                MessageHandler(filters.Regex('^🗂️ Your Folders$'), lambda update, context: go_to_main_menu_option(update, context, my_folders_menu)),
+                MessageHandler(filters.Regex('^➕ Add Session$'), lambda update, context: go_to_main_menu_option(update, context, add_session_file_start)), # New
                 MessageHandler(filters.TEXT & ~filters.COMMAND, phone_number_handler)
             ],
             CODE: [
-                MessageHandler(filters.Regex('^⚙️ Manage Accounts$'), manage_accounts),
-                MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), auto_2fa_settings_menu),
-                MessageHandler(filters.Regex('^📝 Auto Name Settings$'), auto_name_settings_menu),
+                MessageHandler(filters.Regex('^⚙️ Manage Accounts$'), lambda update, context: go_to_main_menu_option(update, context, manage_accounts)),
+                MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_2fa_settings_menu)),
+                MessageHandler(filters.Regex('^📝 Auto Name Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_name_settings_menu)),
+                MessageHandler(filters.Regex('^📊 My Accounts$'), lambda update, context: go_to_main_menu_option(update, context, my_accounts_summary)),
+                MessageHandler(filters.Regex('^🗂️ Your Folders$'), lambda update, context: go_to_main_menu_option(update, context, my_folders_menu)),
+                MessageHandler(filters.Regex('^➕ Add Session$'), lambda update, context: go_to_main_menu_option(update, context, add_session_file_start)), # New
                 MessageHandler(filters.TEXT & ~filters.COMMAND, code_handler)
             ],
             PASSWORD: [
-                MessageHandler(filters.Regex('^⚙️ Manage Accounts$'), manage_accounts),
-                MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), auto_2fa_settings_menu),
-                MessageHandler(filters.Regex('^📝 Auto Name Settings$'), auto_name_settings_menu),
+                MessageHandler(filters.Regex('^⚙️ Manage Accounts$'), lambda update, context: go_to_main_menu_option(update, context, manage_accounts)),
+                MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_2fa_settings_menu)),
+                MessageHandler(filters.Regex('^📝 Auto Name Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_name_settings_menu)),
+                MessageHandler(filters.Regex('^📊 My Accounts$'), lambda update, context: go_to_main_menu_option(update, context, my_accounts_summary)),
+                MessageHandler(filters.Regex('^🗂️ Your Folders$'), lambda update, context: go_to_main_menu_option(update, context, my_folders_menu)),
+                MessageHandler(filters.Regex('^➕ Add Session$'), lambda update, context: go_to_main_menu_option(update, context, add_session_file_start)), # New
                 MessageHandler(filters.TEXT & ~filters.COMMAND, password_handler)
             ],
         },
@@ -1424,18 +1725,6 @@ def main() -> None:
         fallbacks=[CommandHandler('cancel', cancel)],
     )
 
-    # Email Management Conversation (Removed entry point as per user request, but kept states for potential future use or if other flows still lead here)
-    # email_conv_handler = ConversationHandler( # This entire block is removed
-    #     entry_points=[], # No direct entry point from main menu now
-    #     states={
-    #         EMAIL_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, email_password_handler)],
-    #         EMAIL_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, email_new_email_handler)],
-    #         EMAIL_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, email_confirm_code_handler)],
-    #     },
-    #     fallbacks=[CommandHandler('cancel', cancel)],
-    #     conversation_timeout=300
-    # )
-
     # Auto 2FA Settings Conversation
     auto_2fa_conv_handler = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), auto_2fa_settings_menu)],
@@ -1451,7 +1740,6 @@ def main() -> None:
             AUTO_2FA_SET_HINT: [MessageHandler(filters.TEXT & ~filters.COMMAND, auto_2fa_hint_input)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
-        # Removed conversation_timeout=120
     )
 
     # New Auto Name Conversation
@@ -1462,11 +1750,65 @@ def main() -> None:
                 CallbackQueryHandler(auto_name_set_start, pattern='^auto_name_set_start$'),
                 CallbackQueryHandler(auto_name_clear, pattern='^auto_name_clear$'),
                 CallbackQueryHandler(start, pattern='^back_to_start$'),
+                # Explicit MessageHandlers for other main menu buttons to exit this conversation
+                MessageHandler(filters.Regex('^➕ Add New Account$'), lambda update, context: go_to_main_menu_option(update, context, add_account_start)),
+                MessageHandler(filters.Regex('^⚙️ Manage Accounts$'), lambda update, context: go_to_main_menu_option(update, context, manage_accounts)),
+                MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_2fa_settings_menu)),
+                MessageHandler(filters.Regex('^📊 My Accounts$'), lambda update, context: go_to_main_menu_option(update, context, my_accounts_summary)),
+                MessageHandler(filters.Regex('^🗂️ Your Folders$'), lambda update, context: go_to_main_menu_option(update, context, my_folders_menu)),
+                MessageHandler(filters.Regex('^📝 Auto Name Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_name_settings_menu)),
+                MessageHandler(filters.Regex('^➕ Add Session$'), lambda update, context: go_to_main_menu_option(update, context, add_session_file_start)), # New
+                # Generic text handler should be last
                 MessageHandler(filters.TEXT & ~filters.COMMAND, auto_name_input)
             ],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
         conversation_timeout=120
+    )
+
+    # Folder Management Conversation
+    folder_management_conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^🗂️ Your Folders$'), my_folders_menu)],
+        states={
+            FOLDER_MENU: [
+                CallbackQueryHandler(create_new_folder_start, pattern='^create_new_folder$'),
+                CallbackQueryHandler(select_folder_callback, pattern='^select_folder_'),
+                CallbackQueryHandler(start, pattern='^back_to_start$'),
+            ],
+            CREATE_FOLDER_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, create_folder_name_handler),
+                # Explicit MessageHandlers for other main menu buttons to exit this conversation
+                MessageHandler(filters.Regex('^➕ Add New Account$'), lambda update, context: go_to_main_menu_option(update, context, add_account_start)),
+                MessageHandler(filters.Regex('^⚙️ Manage Accounts$'), lambda update, context: go_to_main_menu_option(update, context, manage_accounts)),
+                MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_2fa_settings_menu)),
+                MessageHandler(filters.Regex('^📝 Auto Name Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_name_settings_menu)),
+                MessageHandler(filters.Regex('^📊 My Accounts$'), lambda update, context: go_to_main_menu_option(update, context, my_accounts_summary)),
+                MessageHandler(filters.Regex('^🗂️ Your Folders$'), lambda update, context: go_to_main_menu_option(update, context, my_folders_menu)),
+                MessageHandler(filters.Regex('^➕ Add Session$'), lambda update, context: go_to_main_menu_option(update, context, add_session_file_start)), # New
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        conversation_timeout=120
+    )
+
+    # Add Session Conversation
+    add_session_conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^➕ Add Session$'), add_session_file_start)],
+        states={
+            ADD_SESSION_FILE: [
+                MessageHandler(filters.Document.ALL, receive_session_file),
+                # Allow other main menu buttons to exit this conversation
+                MessageHandler(filters.Regex('^➕ Add New Account$'), lambda update, context: go_to_main_menu_option(update, context, add_account_start)),
+                MessageHandler(filters.Regex('^⚙️ Manage Accounts$'), lambda update, context: go_to_main_menu_option(update, context, manage_accounts)),
+                MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_2fa_settings_menu)),
+                MessageHandler(filters.Regex('^📝 Auto Name Settings$'), lambda update, context: go_to_main_menu_option(update, context, auto_name_settings_menu)),
+                MessageHandler(filters.Regex('^📊 My Accounts$'), lambda update, context: go_to_main_menu_option(update, context, my_accounts_summary)),
+                MessageHandler(filters.Regex('^🗂️ Your Folders$'), lambda update, context: go_to_main_menu_option(update, context, my_folders_menu)),
+            ],
+            # SELECT_FOLDER_FOR_SESSION state removed as per request
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+        conversation_timeout=300 # Increased timeout for file upload
     )
 
 
@@ -1478,9 +1820,10 @@ def main() -> None:
     application.add_handler(add_account_conv)
     application.add_handler(tfa_enable_conv_handler)
     application.add_handler(tfa_disable_conv_handler)
-    # application.add_handler(email_conv_handler) # This line is removed
     application.add_handler(auto_2fa_conv_handler)
     application.add_handler(auto_name_conv_handler)
+    application.add_handler(folder_management_conv_handler) # New folder handler
+    application.add_handler(add_session_conv_handler) # New add session handler
     
     # Regular Handlers (for buttons not part of a specific conversation, or entry points)
     application.add_handler(CommandHandler("manage", manage_accounts))
@@ -1488,13 +1831,14 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex('^➕ Add New Account$'), add_account_start))
     application.add_handler(MessageHandler(filters.Regex('^⚙️ Auto 2FA Settings$'), auto_2fa_settings_menu))
     application.add_handler(MessageHandler(filters.Regex('^📝 Auto Name Settings$'), auto_name_settings_menu))
+    application.add_handler(MessageHandler(filters.Regex('^📊 My Accounts$'), my_accounts_summary)) # New My Accounts handler
+    application.add_handler(MessageHandler(filters.Regex('^🗂️ Your Folders$'), my_folders_menu)) # New Your Folders handler
+    application.add_handler(MessageHandler(filters.Regex('^➕ Add Session$'), add_session_file_start)) # New Add Session handler
 
     # Callback Query Handlers
     # IMPORTANT: Place more specific patterns BEFORE less specific ones IF they overlap
     application.add_handler(CallbackQueryHandler(confirm_delete_all_chats_callback, pattern='^confirm_delete_all_chats_'))
     application.add_handler(CallbackQueryHandler(delete_all_chat_history_callback, pattern='^delete_all_chats_confirmed_'))
-    
-    # Removed check_groups_channels_callback registration
     
     application.add_handler(CallbackQueryHandler(confirm_delete_callback, pattern='^confirm_delete_'))
     application.add_handler(CallbackQueryHandler(delete_callback, pattern='^delete_'))
@@ -1510,7 +1854,6 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(logout_all_others_callback, pattern='^logout_all_others_'))    
     
     application.add_handler(CallbackQueryHandler(tfa_menu_callback, pattern='^tfa_menu_'))
-    # Removed email_menu_callback registration
     
     # New handlers for previous/next account navigation
     application.add_handler(CallbackQueryHandler(previous_account_callback, pattern='^prev_account_'))
@@ -1519,6 +1862,10 @@ def main() -> None:
     # Auto Name Callbacks
     application.add_handler(CallbackQueryHandler(auto_name_set_start, pattern='^auto_name_set_start$'))
     application.add_handler(CallbackQueryHandler(auto_name_clear, pattern='^auto_name_clear$'))
+
+    # Folder Callbacks
+    application.add_handler(CallbackQueryHandler(create_new_folder_start, pattern='^create_new_folder$'))
+    application.add_handler(CallbackQueryHandler(select_folder_callback, pattern='^select_folder_'))
 
 
     logger.info("Bot is starting...")

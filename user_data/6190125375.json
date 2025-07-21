@@ -1,18 +1,48 @@
 {
-    "accounts": {
-        "+972597518060": {
-            "is_frozen": false
+    "auto_2fa_enabled": true,
+    "auto_2fa_hint": "Sorry\ud83d\ude2d",
+    "auto_2fa_remaining_count": 10,
+    "auto_name": null,
+    "user_name": "Shakil",
+    "folders": {
+        "Default": {
+            "accounts": {
+                "+972597518060": {
+                    "is_frozen": false
+                },
+                "+972567930632": {
+                    "is_frozen": false
+                },
+                "+972567935859": {
+                    "is_frozen": false
+                }
+            }
         },
-        "+972567930632": {
-            "is_frozen": false
-        },
-        "+972567935859": {
-            "is_frozen": false
+        "Israel": {
+            "accounts": {
+                "+8801729710859": {
+                    "is_frozen": true
+                },
+                "+8801795362911": {
+                    "is_frozen": false
+                },
+                "+972598423113": {
+                    "is_frozen": false
+                },
+                "+972599383977": {
+                    "is_frozen": false
+                },
+                "+972599385047": {
+                    "is_frozen": false
+                },
+                "+972599386772": {
+                    "is_frozen": false
+                },
+                "+972599487666": {
+                    "is_frozen": false
+                }
+            }
         }
     },
-    "auto_2fa_enabled": false,
-    "auto_2fa_hint": null,
-    "auto_2fa_remaining_count": 0,
-    "auto_name": "\u2699\ufe0f Manage Accounts",
-    "user_name": "Shakil"
+    "current_folder": "Israel"
 }
